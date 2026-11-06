@@ -3,21 +3,29 @@ from flask import Flask, render_template_string, request, redirect, url_for, ses
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 import os
-from pymongo import MongoClient
-from bson import ObjectId
+import sqlite3
+import uuid
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "tender_management_secret_key_2024")
 
-# MongoDB Atlas Connection
-MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
-client = MongoClient(MONGODB_URI)
-db = client["tender_management"]
+# SQLite database - persistent on Render.com
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "/tmp/tender_management.db")
 
-# Collections
-users_collection = db["users"]
-tenders_collection = db["tenders"]
-bids_collection = db["bids"]
+def get_db():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, role TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY, title TEXT, description TEXT, budget TEXT, deadline TEXT, company TEXT, status TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS bids (id TEXT PRIMARY KEY, tender_id TEXT, vendor TEXT, bid_amount TEXT, proposal TEXT, submitted_at TEXT)")
+    conn.commit()
+    conn.close()
+
+init_db()
 
 HOME_TEMPLATE = """
 <!DOCTYPE html>
@@ -105,9 +113,9 @@ HOME_TEMPLATE = """
                         </div>
                         <p>{{ tender.description }}</p>
                         <div class="tender-actions">
-                            <a href="/tender/{{ tender._id }}" class="btn btn-primary">বিস্তারিত দেখুন</a>
+                            <a href="/tender/{{ tender.id }}" class="btn btn-primary">বিস্তারিত দেখুন</a>
                             {% if session.get('role') == 'vendor' and tender.status == 'open' %}
-                                <a href="/bid/{{ tender._id }}" class="btn btn-success">বিড সাবমিট করুন</a>
+                                <a href="/bid/{{ tender.id }}" class="btn btn-success">বিড সাবমিট করুন</a>
                             {% endif %}
                         </div>
                     </div>
@@ -409,7 +417,7 @@ TENDER_DETAIL_TEMPLATE = """
 
 @app.route("/")
 def home():
-    tenders = list(tenders_collection.find().sort("created_at", -1))
+    tenders = list(get_db().execute("SELECT * FROM tenders ORDER BY created_at DESC").fetchall())
     return render_template_string(HOME_TEMPLATE, tenders=tenders)
 
 @app.route("/register", methods=["GET", "POST"])
@@ -419,16 +427,14 @@ def register():
         password = request.form["password"]
         role = request.form["role"]
 
-        if users_collection.find_one({"username": username}):
+        if get_db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone():
             flash("এই ইউজারনেম ইতিমধ্যে নিবন্ধিত!")
             return redirect(url_for("register"))
 
-        users_collection.insert_one({
-            "username": username,
-            "password": generate_password_hash(password),
-            "role": role,
-            "created_at": datetime.now()
-        })
+        conn = get_db()
+        conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (username, generate_password_hash(password), role, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
 
         flash("রেজিস্ট্রেশন সফল! এখন লগইন করুন।")
         return redirect(url_for("login"))
@@ -441,7 +447,7 @@ def login():
         username = request.form["username"]
         password = request.form["password"]
 
-        user = users_collection.find_one({"username": username})
+        user = get_db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
         if not user or not check_password_hash(user["password"], password):
             flash("ইউজারনেম বা পাসওয়ার্ড ভুল!")
@@ -477,7 +483,10 @@ def create_tender():
             "created_at": datetime.now()
         }
 
-        tenders_collection.insert_one(tender)
+        conn = get_db()
+        conn.execute("INSERT INTO tenders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), tender["title"], tender["description"], tender["budget"], tender["deadline"], tender["company"], tender["status"], tender["created_at"].isoformat()))
+        conn.commit()
+        conn.close()
 
         flash("টেন্ডার সফলভাবে পাবলিশ হয়েছে!")
         return redirect(url_for("home"))
@@ -490,7 +499,7 @@ def submit_bid(tender_id):
         flash("শুধুমাত্র ভেন্ডর বিড সাবমিট করতে পারবে!")
         return redirect(url_for("home"))
 
-    tender = tenders_collection.find_one({"_id": ObjectId(tender_id)})
+    tender = get_db().execute("SELECT * FROM tenders WHERE id = ?", (tender_id,)).fetchone()
 
     if not tender:
         flash("টেন্ডার পাওয়া যায়নি!")
@@ -502,14 +511,17 @@ def submit_bid(tender_id):
 
     if request.method == "POST":
         bid = {
-            "tender_id": ObjectId(tender_id),
+            "tender_id": tender_id,
             "vendor": session["user"],
             "bid_amount": request.form["bid_amount"],
             "proposal": request.form["proposal"],
             "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        bids_collection.insert_one(bid)
+        conn = get_db()
+        conn.execute("INSERT INTO bids VALUES (?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), tender_id, bid["vendor"], bid["bid_amount"], bid["proposal"], bid["submitted_at"]))
+        conn.commit()
+        conn.close()
 
         flash("বিড সফলভাবে সাবমিট হয়েছে!")
         return redirect(url_for("home"))
@@ -518,13 +530,13 @@ def submit_bid(tender_id):
 
 @app.route("/tender/<tender_id>")
 def tender_detail(tender_id):
-    tender = tenders_collection.find_one({"_id": ObjectId(tender_id)})
+    tender = get_db().execute("SELECT * FROM tenders WHERE id = ?", (tender_id,)).fetchone()
 
     if not tender:
         flash("টেন্ডার পাওয়া যায়নি!")
         return redirect(url_for("home"))
 
-    bids = list(bids_collection.find({"tender_id": ObjectId(tender_id)}))
+    bids = list(get_db().execute("SELECT * FROM bids WHERE tender_id = ?", (tender_id,)).fetchall())
 
     return render_template_string(TENDER_DETAIL_TEMPLATE, tender=tender, bids=bids)
 
