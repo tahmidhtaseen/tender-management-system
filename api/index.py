@@ -2,24 +2,22 @@
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import json
 import os
+from pymongo import MongoClient
+from bson import ObjectId
 
 app = Flask(__name__)
-app.secret_key = "tender_management_secret_key_2024"
+app.secret_key = os.environ.get("SECRET_KEY", "tender_management_secret_key_2024")
 
-# Vercel-এ /tmp ডিরেক্টরি ব্যবহার করতে হয়
-DATA_FILE = "/tmp/tender_data.json"
+# MongoDB Atlas Connection
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
+client = MongoClient(MONGODB_URI)
+db = client["tender_management"]
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"users": {}, "tenders": [], "bids": []}
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# Collections
+users_collection = db["users"]
+tenders_collection = db["tenders"]
+bids_collection = db["bids"]
 
 HOME_TEMPLATE = """
 <!DOCTYPE html>
@@ -32,9 +30,9 @@ HOME_TEMPLATE = """
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
         .container { max-width: 1200px; margin: 0 auto; }
-        .header { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
-        .header h1 { color: #667eea; }
-        .user-info { display: flex; gap: 15px; align-items: center; }
+        .header { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+        .header h1 { color: #667eea; margin-bottom: 10px; }
+        .user-info { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
         .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; font-weight: bold; transition: all 0.3s; }
         .btn-primary { background: #667eea; color: white; }
         .btn-primary:hover { background: #5568d3; }
@@ -48,17 +46,17 @@ HOME_TEMPLATE = """
         .tender-card { border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 15px; border-radius: 8px; background: #f7fafc; }
         .tender-card h3 { color: #2d3748; margin-bottom: 10px; }
         .tender-meta { color: #718096; font-size: 14px; margin-bottom: 10px; }
-        .tender-actions { margin-top: 15px; display: flex; gap: 10px; }
+        .tender-actions { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
         .badge { padding: 5px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
         .badge-open { background: #48bb78; color: white; }
         .badge-closed { background: #f56565; color: white; }
         .flash { padding: 15px; margin-bottom: 20px; border-radius: 5px; }
         .flash-success { background: #c6f6d5; color: #22543d; }
         .flash-error { background: #fed7d7; color: #742a2a; }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2d3748; }
-        .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 5px; font-size: 14px; }
-        .form-group textarea { min-height: 100px; }
+        @media (max-width: 768px) {
+            .header { flex-direction: column; align-items: flex-start; }
+            .user-info { width: 100%; justify-content: flex-start; }
+        }
     </style>
 </head>
 <body>
@@ -107,9 +105,9 @@ HOME_TEMPLATE = """
                         </div>
                         <p>{{ tender.description }}</p>
                         <div class="tender-actions">
-                            <a href="/tender/{{ tender.id }}" class="btn btn-primary">বিস্তারিত দেখুন</a>
+                            <a href="/tender/{{ tender._id }}" class="btn btn-primary">বিস্তারিত দেখুন</a>
                             {% if session.get('role') == 'vendor' and tender.status == 'open' %}
-                                <a href="/bid/{{ tender.id }}" class="btn btn-success">বিড সাবমিট করুন</a>
+                                <a href="/bid/{{ tender._id }}" class="btn btn-success">বিড সাবমিট করুন</a>
                             {% endif %}
                         </div>
                     </div>
@@ -128,16 +126,17 @@ LOGIN_TEMPLATE = """
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>লগইন - টেন্ডার ম্যানেজমেন্ট</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-        .login-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 400px; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .login-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 100%; max-width: 400px; }
         .login-box h2 { text-align: center; color: #667eea; margin-bottom: 30px; }
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2d3748; }
         .form-group input { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 5px; font-size: 14px; }
-        .btn { width: 100%; padding: 12px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 10px; }
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 10px; text-decoration: none; display: block; text-align: center; }
         .btn-primary { background: #667eea; color: white; }
         .btn-primary:hover { background: #5568d3; }
         .btn-secondary { background: #718096; color: white; }
@@ -181,16 +180,17 @@ REGISTER_TEMPLATE = """
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>রেজিস্টার - টেন্ডার ম্যানেজমেন্ট</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-        .register-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 450px; }
+        .register-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 100%; max-width: 450px; }
         .register-box h2 { text-align: center; color: #667eea; margin-bottom: 30px; }
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2d3748; }
         .form-group input, .form-group select { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 5px; font-size: 14px; }
-        .btn { width: 100%; padding: 12px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 10px; }
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 10px; text-decoration: none; display: block; text-align: center; }
         .btn-success { background: #48bb78; color: white; }
         .btn-success:hover { background: #38a169; }
         .btn-secondary { background: #718096; color: white; }
@@ -242,6 +242,7 @@ CREATE_TENDER_TEMPLATE = """
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>নতুন টেন্ডার তৈরি করুন</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -252,10 +253,10 @@ CREATE_TENDER_TEMPLATE = """
         .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2d3748; }
         .form-group input, .form-group textarea { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 5px; font-size: 14px; }
         .form-group textarea { min-height: 120px; }
-        .btn { padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-right: 10px; }
+        .btn { padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-right: 10px; text-decoration: none; display: inline-block; }
         .btn-success { background: #48bb78; color: white; }
         .btn-success:hover { background: #38a169; }
-        .btn-secondary { background: #718096; color: white; text-decoration: none; display: inline-block; }
+        .btn-secondary { background: #718096; color: white; }
         .btn-secondary:hover { background: #4a5568; }
     </style>
 </head>
@@ -292,6 +293,7 @@ BID_TEMPLATE = """
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>বিড সাবমিট করুন</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -303,10 +305,10 @@ BID_TEMPLATE = """
         .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2d3748; }
         .form-group input, .form-group textarea { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 5px; font-size: 14px; }
         .form-group textarea { min-height: 100px; }
-        .btn { padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-right: 10px; }
+        .btn { padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; margin-right: 10px; text-decoration: none; display: inline-block; }
         .btn-success { background: #48bb78; color: white; }
         .btn-success:hover { background: #38a169; }
-        .btn-secondary { background: #718096; color: white; text-decoration: none; display: inline-block; }
+        .btn-secondary { background: #718096; color: white; }
         .btn-secondary:hover { background: #4a5568; }
     </style>
 </head>
@@ -341,6 +343,7 @@ TENDER_DETAIL_TEMPLATE = """
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>টেন্ডার বিস্তারিত</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -406,8 +409,8 @@ TENDER_DETAIL_TEMPLATE = """
 
 @app.route("/")
 def home():
-    data = load_data()
-    return render_template_string(HOME_TEMPLATE, tenders=data["tenders"])
+    tenders = list(tenders_collection.find().sort("created_at", -1))
+    return render_template_string(HOME_TEMPLATE, tenders=tenders)
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
@@ -416,17 +419,16 @@ def register():
         password = request.form["password"]
         role = request.form["role"]
 
-        data = load_data()
-
-        if username in data["users"]:
+        if users_collection.find_one({"username": username}):
             flash("এই ইউজারনেম ইতিমধ্যে নিবন্ধিত!")
             return redirect(url_for("register"))
 
-        data["users"][username] = {
+        users_collection.insert_one({
+            "username": username,
             "password": generate_password_hash(password),
-            "role": role
-        }
-        save_data(data)
+            "role": role,
+            "created_at": datetime.now()
+        })
 
         flash("রেজিস্ট্রেশন সফল! এখন লগইন করুন।")
         return redirect(url_for("login"))
@@ -439,14 +441,9 @@ def login():
         username = request.form["username"]
         password = request.form["password"]
 
-        data = load_data()
+        user = users_collection.find_one({"username": username})
 
-        if username not in data["users"]:
-            flash("ইউজারনেম বা পাসওয়ার্ড ভুল!")
-            return redirect(url_for("login"))
-
-        user = data["users"][username]
-        if not check_password_hash(user["password"], password):
+        if not user or not check_password_hash(user["password"], password):
             flash("ইউজারনেম বা পাসওয়ার্ড ভুল!")
             return redirect(url_for("login"))
 
@@ -470,36 +467,30 @@ def create_tender():
         return redirect(url_for("home"))
 
     if request.method == "POST":
-        data = load_data()
-
-        tender_id = len(data["tenders"]) + 1
         tender = {
-            "id": tender_id,
             "title": request.form["title"],
             "description": request.form["description"],
             "budget": request.form["budget"],
             "deadline": request.form["deadline"],
             "company": session["user"],
             "status": "open",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "created_at": datetime.now()
         }
 
-        data["tenders"].append(tender)
-        save_data(data)
+        tenders_collection.insert_one(tender)
 
         flash("টেন্ডার সফলভাবে পাবলিশ হয়েছে!")
         return redirect(url_for("home"))
 
     return render_template_string(CREATE_TENDER_TEMPLATE)
 
-@app.route("/bid/<int:tender_id>", methods=["GET", "POST"])
+@app.route("/bid/<tender_id>", methods=["GET", "POST"])
 def submit_bid(tender_id):
     if "user" not in session or session["role"] != "vendor":
         flash("শুধুমাত্র ভেন্ডর বিড সাবমিট করতে পারবে!")
         return redirect(url_for("home"))
 
-    data = load_data()
-    tender = next((t for t in data["tenders"] if t["id"] == tender_id), None)
+    tender = tenders_collection.find_one({"_id": ObjectId(tender_id)})
 
     if not tender:
         flash("টেন্ডার পাওয়া যায়নি!")
@@ -511,31 +502,29 @@ def submit_bid(tender_id):
 
     if request.method == "POST":
         bid = {
-            "tender_id": tender_id,
+            "tender_id": ObjectId(tender_id),
             "vendor": session["user"],
             "bid_amount": request.form["bid_amount"],
             "proposal": request.form["proposal"],
             "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        data["bids"].append(bid)
-        save_data(data)
+        bids_collection.insert_one(bid)
 
         flash("বিড সফলভাবে সাবমিট হয়েছে!")
         return redirect(url_for("home"))
 
     return render_template_string(BID_TEMPLATE, tender=tender)
 
-@app.route("/tender/<int:tender_id>")
+@app.route("/tender/<tender_id>")
 def tender_detail(tender_id):
-    data = load_data()
-    tender = next((t for t in data["tenders"] if t["id"] == tender_id), None)
+    tender = tenders_collection.find_one({"_id": ObjectId(tender_id)})
 
     if not tender:
         flash("টেন্ডার পাওয়া যায়নি!")
         return redirect(url_for("home"))
 
-    bids = [b for b in data["bids"] if b["tender_id"] == tender_id]
+    bids = list(bids_collection.find({"tender_id": ObjectId(tender_id)}))
 
     return render_template_string(TENDER_DETAIL_TEMPLATE, tender=tender, bids=bids)
 
